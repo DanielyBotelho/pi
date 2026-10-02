@@ -9,6 +9,10 @@ import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-a
 import {
 	contentText,
 	getCurrentSystemMessage,
+	getCurrentTools,
+	getInitialSystemMessage,
+	hasToolRedefinitions,
+	isContextOverflow,
 	normalizeContext,
 	type RetryCallbacks,
 	type RetryPolicy,
@@ -111,6 +115,16 @@ export interface CompactionResult<T = unknown> {
 	usage?: Usage;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
+}
+
+export interface CacheFriendlyCompactionOptions {
+	customInstructions?: string;
+	signal?: AbortSignal;
+	streamFn?: StreamFn;
+	requestOptions: SimpleStreamOptions;
+	retry?: RetryPolicy;
+	callbacks?: RetryCallbacks;
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 }
 
 // ============================================================================
@@ -610,7 +624,7 @@ function createSummarizationOptions(
 }
 
 /**
- * Shared choke point for every compaction/branch-summary summarization call. Wraps the
+ * Shared choke point for standalone compaction and branch-summary calls. Wraps the
  * single LLM call in {@link retryAssistantCall} so transient stream drops (e.g.
  * `terminated`, socket close) honor the configured retry policy instead of failing
  * the whole compaction on the first attempt. Deterministic errors and aborts return
@@ -772,6 +786,10 @@ export async function generateSummaryWithUsage(
 export interface CompactionPreparation {
 	/** UUID of first entry to keep */
 	firstKeptEntryId: string;
+	/** Complete projected context before compaction. */
+	contextMessages?: AgentMessage[];
+	/** Message index in contextMessages where the retained suffix begins. */
+	firstKeptMessageIndex?: number;
 	/** Messages that will be summarized and discarded */
 	messagesToSummarize: AgentMessage[];
 	/** Messages that will be turned into turn prefix summary (if splitting) */
@@ -923,8 +941,14 @@ export function prepareCompaction(
 		}
 	}
 
+	const firstKeptMessageIndex = projectedEntries
+		.slice(0, cutPoint.firstKeptEntryIndex)
+		.reduce((count, entry) => count + entry.messages.length, 0);
+
 	return {
 		firstKeptEntryId,
+		contextMessages: projection.messages,
+		firstKeptMessageIndex,
 		messagesToSummarize,
 		turnPrefixMessages,
 		isSplitTurn: cutPoint.isSplitTurn,
@@ -938,6 +962,109 @@ export function prepareCompaction(
 // ============================================================================
 // Main compaction function
 // ============================================================================
+
+const CACHE_FRIENDLY_COMPACTION_BOUNDARY = `<pi-compaction-boundary>
+Messages before this marker must be summarized. Messages after this marker are recent context that will be retained verbatim. Do not repeat the recent messages in the summary.
+</pi-compaction-boundary>`;
+
+const CACHE_FRIENDLY_COMPACTION_PROMPT = `Create a structured context checkpoint for the conversation before the <pi-compaction-boundary> marker.
+
+The messages after the marker are provided only so you understand where the retained conversation continues. They will remain verbatim after compaction. Do not summarize or repeat them.
+
+Do not continue the conversation or answer any request from it. Output only the checkpoint summary.
+
+${SUMMARIZATION_PROMPT}`;
+
+function supportsNativeToolUnload(model: Model<any>, context: TranscriptContext): boolean {
+	if (model.api !== "anthropic-messages") return false;
+	const anthropicModel = model as Model<"anthropic-messages">;
+	return (
+		anthropicModel.compat?.supportsMidConvoSystemMessages === true &&
+		anthropicModel.compat?.supportsMidConvoToolChanges === true &&
+		(getInitialSystemMessage(context.messages)?.toolsAdded?.length ?? 0) > 0 &&
+		!hasToolRedefinitions(context.messages)
+	);
+}
+
+/**
+ * Summarize the current transcript in place so the provider can reuse its prompt cache.
+ * Returns undefined when the transport cannot unload tools or the expanded request overflows.
+ */
+export async function compactCacheFriendly(
+	preparation: CompactionPreparation,
+	model: Model<any>,
+	options: CacheFriendlyCompactionOptions,
+): Promise<CompactionResult | undefined> {
+	const { contextMessages, firstKeptMessageIndex } = preparation;
+	if (!contextMessages || firstKeptMessageIndex === undefined) return undefined;
+
+	const currentContext = normalizeContext({ messages: convertToLlm(contextMessages) });
+	const currentTools = getCurrentTools(currentContext.messages);
+	if (currentTools.length > 0 && !supportsNativeToolUnload(model, currentContext)) return undefined;
+	const timestamp = Date.now();
+	const boundary: AgentMessage = currentTools.length
+		? { role: "system", content: CACHE_FRIENDLY_COMPACTION_BOUNDARY, timestamp }
+		: { role: "user", content: [{ type: "text", text: CACHE_FRIENDLY_COMPACTION_BOUNDARY }], timestamp };
+	let prompt = CACHE_FRIENDLY_COMPACTION_PROMPT;
+	if (options.customInstructions) prompt += `\n\nAdditional focus: ${options.customInstructions}`;
+	const transientMessages: AgentMessage[] = [
+		...contextMessages.slice(0, firstKeptMessageIndex),
+		boundary,
+		...contextMessages.slice(firstKeptMessageIndex),
+		...(currentTools.length > 0
+			? [
+					{
+						role: "system" as const,
+						content: "",
+						toolsRemoved: currentTools.map((tool) => ({ name: tool.name })),
+						timestamp,
+					},
+				]
+			: []),
+		{ role: "user", content: [{ type: "text", text: prompt }], timestamp },
+	];
+	const transformed = options.transformContext
+		? await options.transformContext(transientMessages, options.signal)
+		: transientMessages;
+	const context = normalizeContext({ messages: convertToLlm(transformed) });
+	const hasBoundary = context.messages.some(
+		(message) =>
+			message.role !== "assistant" && contentText(message.content).includes(CACHE_FRIENDLY_COMPACTION_BOUNDARY),
+	);
+	const hasPrompt = context.messages.some(
+		(message) => message.role === "user" && contentText(message.content).includes(CACHE_FRIENDLY_COMPACTION_PROMPT),
+	);
+	if (
+		!hasBoundary ||
+		!hasPrompt ||
+		getCurrentTools(context.messages).length > 0 ||
+		(currentTools.length > 0 && !supportsNativeToolUnload(model, context))
+	) {
+		return undefined;
+	}
+
+	const requestOptions: SimpleStreamOptions = { ...options.requestOptions, signal: options.signal };
+	const produce = async (): Promise<AssistantMessage> =>
+		options.streamFn
+			? (await options.streamFn(model, context, requestOptions)).result()
+			: completeSimple(model, context, requestOptions);
+	const response = await retryAssistantCall(produce, options.retry, options.signal, options.callbacks);
+	if (response.stopReason === "error" && isContextOverflow(response)) return undefined;
+	const failure = getSummarizationFailure(response, "Summarization");
+	if (failure) throw new Error(failure);
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new Error("Summarization attempted to call a tool");
+	}
+
+	const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
+	return {
+		summary: contentText(response.content) + formatFileOperations(readFiles, modifiedFiles),
+		firstKeptEntryId: preparation.firstKeptEntryId,
+		tokensBefore: preparation.tokensBefore,
+		usage: response.usage,
+		details: { readFiles, modifiedFiles } as CompactionDetails,
+	};
+}
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.
 

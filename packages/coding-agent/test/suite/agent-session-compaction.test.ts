@@ -338,6 +338,13 @@ describe("AgentSession compaction characterization", () => {
 		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
+		harness.sessionManager.appendMessage({
+			role: "system",
+			content: "",
+			toolsAdded: [{ name: "unsupported_tool", description: "unsupported", parameters: Type.Object({}) }],
+			timestamp: Date.now(),
+		});
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 
 		const transformContext = vi.fn(async (messages: AgentMessage[]) => messages);
 		harness.session.agent.transformContext = transformContext;
@@ -361,6 +368,123 @@ describe("AgentSession compaction characterization", () => {
 		expect(requestOptions).toMatchObject({ cacheRetention: "none" });
 		expect(requestOptions?.sessionId).not.toBe("active-routing-session");
 		expect(requestOptions?.transport).toBeUndefined();
+	});
+
+	it("reuses the current context and transiently unloads tools for supported compaction", async () => {
+		const cacheTool: AgentTool = {
+			name: "cache_tool",
+			label: "Cache tool",
+			description: "A tool that must be unavailable while compacting",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "unused" }], details: {} }),
+		};
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			tools: [cacheTool],
+			initialActiveToolNames: [cacheTool.name],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first answer"), fauxAssistantMessage("second answer")]);
+		await harness.session.prompt("first request");
+		await harness.session.prompt("second request");
+		harness.session.agent.state.model = {
+			...harness.getModel(),
+			api: "anthropic-messages",
+			compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true },
+		};
+		harness.session.agent.sessionId = "cache-friendly-session";
+		harness.session.agent.transport = "websocket";
+
+		let requestContext: TranscriptContext | undefined;
+		let requestOptions: SimpleStreamOptions | undefined;
+		const getStreamCallCount = useSummaryStreamFn(harness, "cache-friendly summary", (context, options) => {
+			requestContext = context;
+			requestOptions = options;
+		});
+		const result = await harness.session.compact("preserve cache details");
+
+		expect(getStreamCallCount()).toBe(1);
+		expect(result.summary).toContain("cache-friendly summary");
+		expect(getCurrentSystemPrompt(requestContext?.messages ?? [])).toContain(harness.session.systemPrompt);
+		expect(getCurrentTools(requestContext?.messages ?? [])).toEqual([]);
+		expect(
+			requestContext?.messages.some((message) => message.role === "system" && message.toolsRemoved?.length),
+		).toBe(true);
+		const serialized = JSON.stringify(requestContext?.messages);
+		expect(serialized).toContain("first request");
+		expect(serialized).toContain("second request");
+		expect(serialized).toContain("<pi-compaction-boundary>");
+		expect(serialized).toContain("Additional focus: preserve cache details");
+		expect(requestOptions).toMatchObject({
+			sessionId: "cache-friendly-session",
+			transport: "websocket",
+		});
+		expect(requestOptions?.cacheRetention).toBeUndefined();
+		expect(requestOptions?.maxTokens).toBeUndefined();
+		expect(JSON.stringify(harness.session.messages)).not.toContain("<pi-compaction-boundary>");
+	});
+
+	it("uses cache-friendly compaction without native tool changes when no tools are active", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			initialActiveToolNames: [],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		let requestContext: TranscriptContext | undefined;
+		const getStreamCallCount = useSummaryStreamFn(harness, "tool-free summary", (context) => {
+			requestContext = context;
+		});
+
+		const result = await harness.session.compact();
+
+		expect(getStreamCallCount()).toBe(1);
+		expect(result.summary).toContain("tool-free summary");
+		expect(getCurrentTools(requestContext?.messages ?? [])).toEqual([]);
+		expect(
+			requestContext?.messages.some((message) => message.role === "system" && message.toolsRemoved?.length),
+		).toBe(false);
+		expect(JSON.stringify(requestContext?.messages)).toContain("<pi-compaction-boundary>");
+	});
+
+	it("falls back to standalone compaction when the full cached context overflows", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			initialActiveToolNames: [],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const contexts: TranscriptContext[] = [];
+		harness.session.agent.streamFunction = (model, context) => {
+			contexts.push(context);
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message = {
+					...fauxAssistantMessage(contexts.length === 1 ? "" : "standalone fallback", {
+						stopReason: contexts.length === 1 ? "error" : "stop",
+						errorMessage: contexts.length === 1 ? "prompt is too long" : undefined,
+					}),
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: createUsage(10),
+				};
+				if (message.stopReason === "error") {
+					stream.push({ type: "error", reason: "error", error: message });
+				} else {
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			});
+			return stream;
+		};
+
+		const result = await harness.session.compact();
+
+		expect(result.summary).toContain("standalone fallback");
+		expect(contexts).toHaveLength(2);
+		expect(JSON.stringify(contexts[0]?.messages)).toContain("<pi-compaction-boundary>");
+		expect(JSON.stringify(contexts[1]?.messages)).not.toContain("<pi-compaction-boundary>");
+		expect(getCurrentSystemPrompt(contexts[1]?.messages ?? [])).not.toBe(harness.session.systemPrompt);
 	});
 
 	it("persists usage from pi-generated manual compaction", async () => {

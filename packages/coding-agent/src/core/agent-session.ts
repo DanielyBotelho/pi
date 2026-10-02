@@ -38,6 +38,7 @@ import type {
 	ImageContent,
 	Model,
 	ProviderHeaders,
+	SimpleStreamOptions,
 	SystemMessage,
 	TextContent,
 	ToolResultMessage,
@@ -70,6 +71,7 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	compactCacheFriendly,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateTokens,
@@ -2675,9 +2677,37 @@ export class AgentSession {
 		customInstructions: string | undefined,
 		signal: AbortSignal,
 		reason: "manual" | "threshold" | "overflow",
+		allowCacheFriendly = true,
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
+		const retry = this.settingsManager.getRetrySettings();
+		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
+		if (allowCacheFriendly && !isVirtualModel(model)) {
+			const requestOptions: SimpleStreamOptions = {
+				apiKey: request.apiKey,
+				headers: request.headers,
+				env: request.env,
+				sessionId: this.agent.sessionId,
+				transport: this.agent.transport,
+				thinkingBudgets: this.agent.thinkingBudgets,
+				maxRetryDelayMs: this.agent.maxRetryDelayMs,
+				onPayload: this.agent.onPayload,
+				onResponse: this.agent.onResponse,
+				onProviderStreamEvent: this.agent.onProviderStreamEvent,
+				...(request.model.reasoning && request.thinkingLevel !== "off" ? { reasoning: request.thinkingLevel } : {}),
+			};
+			const result = await compactCacheFriendly(preparation, request.model, {
+				customInstructions,
+				signal,
+				streamFn: this.agent.streamFunction,
+				requestOptions,
+				retry,
+				callbacks,
+				transformContext: this.agent.transformContext,
+			});
+			if (result) return result;
+		}
 		return compact(
 			preparation,
 			request.model,
@@ -2688,8 +2718,8 @@ export class AgentSession {
 			request.thinkingLevel,
 			this.agent.streamFunction,
 			request.env,
-			this.settingsManager.getRetrySettings(),
-			this._summarizationRetryCallbacks({ source: "compaction", reason }),
+			retry,
+			callbacks,
 			undefined, // sessionId
 		);
 	}
@@ -2966,7 +2996,7 @@ export class AgentSession {
 			// Case 2: the response completed successfully. Compact, but do not retry because
 			// agent.continue() cannot continue from a completed assistant response.
 			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false);
+				return await this._runAutoCompaction("overflow", false, contextOverflow);
 			}
 
 			if (this._overflowRecoveryAttempted) {
@@ -2994,7 +3024,7 @@ export class AgentSession {
 			// Persistently omit the selected final attempt before post-run recovery compaction.
 			this._overflowRecoveryAttempted = true;
 			this._omitRecoveryAttempt(assistantMessage, toolResults);
-			const retry = await this._runAutoCompaction("overflow", willRetry);
+			const retry = await this._runAutoCompaction("overflow", willRetry, contextOverflow);
 			if (retry) this._failedResponse = assistantMessage;
 			return retry;
 		}
@@ -3047,7 +3077,11 @@ export class AgentSession {
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		knownContextOverflow = false,
+	): Promise<boolean> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		let abortController: AbortController | undefined;
@@ -3118,6 +3152,7 @@ export class AgentSession {
 					undefined,
 					abortController.signal,
 					reason,
+					!knownContextOverflow,
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;

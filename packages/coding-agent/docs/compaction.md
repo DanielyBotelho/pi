@@ -20,7 +20,7 @@ Pi has two summarization mechanisms:
 | Compaction | Context exceeds threshold, or `/compact` | Summarize old messages to free up context |
 | Branch summarization | `/tree` navigation | Preserve context when switching branches |
 
-Both use closely related structured formats and track file operations cumulatively. Summarization requests disable prompt-cache writes because these one-off prompts are unlikely to be reused.
+Both use closely related structured formats and track file operations cumulatively. Compaction reuses the current transcript and request settings when the provider can transiently unload tools with native mid-conversation tool changes, allowing the summary request to reuse the existing prompt cache. Tool-free contexts use the same path without requiring native tool changes. Unsupported providers, known overflow recovery, and cache-friendly requests that exceed the context window fall back to a standalone summary request. Branch summaries always use standalone requests with prompt-cache writes disabled.
 
 ## Compaction
 
@@ -44,9 +44,9 @@ You can also trigger manually with `/compact [instructions]`, where optional ins
 
 1. **Find cut point**: Walk backwards through the finalized session projection, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached
 2. **Extract messages**: Collect projected messages from the previous kept boundary (or session start) up to the cut point
-3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
-4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
-5. **Rebuilds context**: Session rebuilds the context for the next request, using summary + messages from `firstKeptEntryId` onwards
+3. **Generate summary**: When supported, insert a transient cutoff marker before the retained messages, transiently remove all tools, and ask the current model to summarize the full current context through that marker. The request uses the current model, reasoning level, routing session, transport, and provider options. Otherwise, use the standalone serialized summarizer.
+4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`; the transient marker, tool removal, instruction, and raw response are not persisted
+5. **Rebuild context**: Session rebuilds the context for the next request, using summary + messages from `firstKeptEntryId` onwards and the normal tool checkpoint
 
 ```
 Before compaction:
@@ -121,7 +121,7 @@ Split user-message span (one span exceeds budget):
   turnPrefixMessages = [usr, ass, tool, ass, tool, tool]
 ```
 
-For split user-message spans, Pi generates two summaries and merges them:
+For split user-message spans, cache-friendly compaction places its cutoff marker at `firstKeptEntryId` and produces one summary of everything before it. Standalone fallback generates two summaries and merges them:
 1. **History summary**: Previous context (if any)
 2. **User-message-span prefix summary**: The early part of the split user-message span
 
@@ -275,7 +275,7 @@ path/to/changed.ts
 
 ### Message Serialization
 
-Before summarization, messages are serialized to text via [`serializeConversation()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts):
+Standalone compaction fallback and branch summarization serialize messages to text via [`serializeConversation()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts). Cache-friendly compaction instead sends the current transcript with a transient cutoff marker:
 
 ```
 [User]: What they said

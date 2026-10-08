@@ -228,7 +228,17 @@ async function answerAuthPrompt(rl: Interface, prompt: AuthPrompt): Promise<stri
 
 async function getContinuationServiceToken(providerId: string, signal: AbortSignal): Promise<string> {
 	const runtime = await ModelRuntime.create({ allowModelNetwork: false, signal });
-	let token = credentialFromAuth(await runtime.getAuth(providerId, { minOAuthValidityMs: 5 * 60_000, signal }));
+	let token: string | undefined;
+	try {
+		token = credentialFromAuth(await runtime.getAuth(providerId, { minOAuthValidityMs: 5 * 60_000, signal }));
+	} catch (error) {
+		if (signal.aborted) throw error;
+		console.log(
+			chalk.dim(
+				`Stored credential for ${providerId} could not be used: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		);
+	}
 	if (token) return token;
 	console.log(chalk.dim("Signing in to the continuation service..."));
 	const rl = createInterface({ input, output });
@@ -285,6 +295,7 @@ async function completeMcpContinuation(
 	body: JsonObject,
 	signal: AbortSignal,
 ): Promise<void> {
+	const uploadSignal = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
 	await postContinuation(
 		continuationEndpoint(payload, "complete", serviceUrl),
 		token,
@@ -298,9 +309,8 @@ async function completeMcpContinuation(
 			},
 			...body,
 		},
-		signal,
+		uploadSignal,
 	);
-	openBrowser(payload.returnUrl);
 }
 
 async function runMcpBearerContinuation(
@@ -320,6 +330,7 @@ async function runMcpBearerContinuation(
 		rl.close();
 	}
 	await completeMcpContinuation(payload, token, serviceUrl, { bearerToken }, signal);
+	openBrowser(payload.returnUrl);
 	console.log(chalk.green("MCP bearer token uploaded."));
 }
 
@@ -342,9 +353,18 @@ async function runMcpOAuthContinuation(
 			store.save(next);
 		},
 	};
+	let uploaded = false;
+	let browserResponseSent = false;
+	const upload = async (): Promise<void> => {
+		state ??= store.load();
+		if (!state?.tokens) throw new AuthContinueError("MCP sign-in did not produce OAuth tokens");
+		console.log(chalk.dim("Uploading MCP authentication to continuation service..."));
+		await completeMcpContinuation(payload, token, serviceUrl, { authState: state }, signal);
+		uploaded = true;
+	};
 	const rl = createInterface({ input, output });
 	try {
-		await signInMcpServer({
+		const result = await signInMcpServer({
 			serverUrl: payload.mcp.serverUrl,
 			store: captureStore,
 			settings: {
@@ -371,17 +391,21 @@ async function runMcpOAuthContinuation(
 					}
 				},
 			},
+			afterAuthorization: async () => {
+				await upload();
+				return payload.returnUrl;
+			},
 			signal,
 		});
+		browserResponseSent = result.browserResponseSent;
 	} catch (error) {
 		if (error instanceof McpSignInCancelledError) throw new AuthContinueError("MCP sign-in cancelled");
 		throw error;
 	} finally {
 		rl.close();
 	}
-	state ??= store.load();
-	if (!state?.tokens) throw new AuthContinueError("MCP sign-in did not produce OAuth tokens");
-	await completeMcpContinuation(payload, token, serviceUrl, { authState: state }, signal);
+	if (!uploaded) await upload();
+	if (!browserResponseSent) openBrowser(payload.returnUrl);
 	console.log(chalk.green("MCP authentication uploaded."));
 }
 
@@ -400,6 +424,7 @@ async function runMcpContinuation(
 		return;
 	}
 	await completeMcpContinuation(payload, token, serviceUrl, {}, signal);
+	openBrowser(payload.returnUrl);
 	console.log(chalk.green("MCP connection saved."));
 }
 

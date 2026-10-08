@@ -208,8 +208,10 @@ async function runAuthCommand(args: string[]): Promise<boolean> {
 		process.exitCode = result.status === "ready" ? 0 : result.status === "not_ready" ? 1 : 2;
 	} catch (error) {
 		const message =
-			error instanceof AuthCommandError || error instanceof AuthContinueError
-				? error.message
+			error instanceof AuthCommandError || error instanceof AuthContinueError || command.kind === "continue"
+				? error instanceof Error
+					? error.message
+					: String(error)
 				: "Failed to resolve credential";
 		console.error(chalk.red(`Error: ${message}`));
 		process.exitCode = command.kind === "check" ? 2 : 1;

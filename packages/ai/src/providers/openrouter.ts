@@ -18,8 +18,8 @@ const OPENROUTER_USER_MODELS_TIMEOUT_MS = 15_000;
  * prices from `GET /models/user`. Image and classifier models are returned unchanged. A missing
  * limit keeps the catalog value. The request uses the provider's configured base URL, so regional
  * endpoints such as `https://us.openrouter.ai/api/v1` apply their region's filtering. When the
- * endpoint rejects the key (401/403), for example a key for a proxy configured in models.json, the
- * catalog is returned unchanged.
+ * endpoint rejects the key (401/403) or does not exist (404), for example with a proxy configured
+ * in models.json, the catalog is returned unchanged.
  */
 export async function personalizeOpenRouterCatalog(
 	catalog: readonly AnyModel[],
@@ -31,7 +31,7 @@ export async function personalizeOpenRouterCatalog(
 		headers: { accept: "application/json", authorization: `Bearer ${key}` },
 		signal: AbortSignal.any([context.signal, AbortSignal.timeout(OPENROUTER_USER_MODELS_TIMEOUT_MS)]),
 	});
-	if (response.status === 401 || response.status === 403) return catalog;
+	if (response.status === 401 || response.status === 403 || response.status === 404) return catalog;
 	if (!response.ok) throw new Error(`OpenRouter model list request failed: ${response.status}`);
 	const body: unknown = await response.json();
 	if (typeof body !== "object" || body === null || !("data" in body) || !Array.isArray(body.data)) {

@@ -131,7 +131,7 @@ Regional endpoints filter models to their region. To use one, set the base URL i
 }
 ```
 
-If OpenRouter rejects the key at `/models/user`, for example a key for a proxy configured as the OpenRouter base URL, Pi lists every OpenRouter model.
+If the base URL rejects the key at `/models/user` or does not have that endpoint, for example a proxy configured as the OpenRouter base URL, Pi lists every OpenRouter model.
 
 ### Azure OpenAI
 

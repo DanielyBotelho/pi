@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from "path";
 import { pathToFileURL } from "url";
 import { closeWatcher, FS_WATCH_RETRY_DELAY_MS, watchWithErrorHandler } from "../utils/fs-watch.ts";
 import { openBrowser } from "../utils/open-browser.ts";
-import { getDiffStat, renderDashboardHtml, writeDashboardFile } from "./pr-dashboard.ts";
+import { getDiffStat, getFileDiffs, renderDashboardHtml, writeDashboardFile } from "./pr-dashboard.ts";
 
 export type GitPaths = {
 	repoDir: string;
@@ -271,8 +271,11 @@ export class FooterDataProvider {
 	/** Builds the PR dashboard HTML, writes it to a temp file, and opens it in the browser if `autoOpen`. */
 	private async generateDashboard(repoDir: string, info: PullRequestInfo, autoOpen: boolean): Promise<void> {
 		try {
-			const diffStat = await getDiffStat(repoDir, info.baseRefName);
-			const html = renderDashboardHtml({ pr: info, jiraUrl: this.getJiraUrl(), diffStat });
+			const [diffStat, fileDiffs] = await Promise.all([
+				getDiffStat(repoDir, info.baseRefName),
+				getFileDiffs(repoDir, info.baseRefName),
+			]);
+			const html = renderDashboardHtml({ pr: info, jiraUrl: this.getJiraUrl(), diffStat, fileDiffs });
 			const repoSlug = basename(repoDir).replace(/[^a-zA-Z0-9_-]/g, "_") || "repo";
 			const path = writeDashboardFile(repoSlug, info.number, html);
 			this.cachedDashboardPath = path;

@@ -43,6 +43,37 @@ export async function getDiffStat(repoDir: string, baseBranch: string): Promise<
 	return [];
 }
 
+const MAX_DIFF_LINES_PER_FILE = 400;
+
+/**
+ * Unified diff hunks per changed file (no `diff --git`/`index`/`---`/`+++` preamble — the file card
+ * already names the file), truncated past MAX_DIFF_LINES_PER_FILE. Tries the remote-tracking ref
+ * first, same as getDiffStat, and must use the same range so paths line up with it.
+ */
+export async function getFileDiffs(repoDir: string, baseBranch: string): Promise<Map<string, string>> {
+	for (const range of [`origin/${baseBranch}...HEAD`, `${baseBranch}...HEAD`]) {
+		const stdout = await execFileText("git", ["diff", "--no-color", range], repoDir);
+		if (stdout === null) continue;
+		const diffs = new Map<string, string>();
+		for (const chunk of stdout.split(/^diff --git /m).slice(1)) {
+			const header = /^a\/(?:.*?) b\/(.*?)\n/.exec(chunk);
+			if (!header) continue;
+			const path = header[1];
+			if (!path) continue;
+			const lines = chunk.slice(header[0].length).split("\n");
+			const hunkStart = lines.findIndex((l) => l.startsWith("@@"));
+			if (hunkStart === -1) continue;
+			const hunkLines = lines.slice(hunkStart);
+			const truncated = hunkLines.length > MAX_DIFF_LINES_PER_FILE;
+			const shown = truncated ? hunkLines.slice(0, MAX_DIFF_LINES_PER_FILE) : hunkLines;
+			const text = shown.join("\n").trimEnd();
+			diffs.set(path, truncated ? `${text}\n… (${hunkLines.length - MAX_DIFF_LINES_PER_FILE} more lines)` : text);
+		}
+		if (diffs.size > 0) return diffs;
+	}
+	return new Map();
+}
+
 /** Text before a `## Changes` heading, if the PR body has one, trimmed. Empty string otherwise. */
 export function parseOverview(body: string): string {
 	const index = body.indexOf("## Changes");
@@ -70,6 +101,7 @@ export interface DashboardInput {
 	pr: PullRequestInfo;
 	jiraUrl: string | null;
 	diffStat: DiffStatEntry[];
+	fileDiffs: Map<string, string>;
 }
 
 /** Splits a path into its directory (trailing slash kept) and final segment. */
@@ -86,7 +118,28 @@ function shortenDir(dir: string, maxSegments = 3): string {
 	return `.../${segments.slice(-maxSegments).join("/")}/`;
 }
 
-function renderFileCard(entry: DiffStatEntry, reason: string | undefined, maxChanged: number): string {
+/** One line of a unified diff hunk, classified and escaped for HTML. */
+function renderDiffLine(line: string): string {
+	const cls = line.startsWith("@@") ? "hunk" : line.startsWith("+") ? "add" : line.startsWith("-") ? "rem" : "ctx";
+	return `<span class="diff-line ${cls}">${escapeHtml(line)}</span>`;
+}
+
+/** Collapsible unified-diff block for one file. Open by default when the change has a stated reason. */
+function renderDiffBlock(diff: string | undefined, openByDefault: boolean): string {
+	if (!diff) return "";
+	const body = diff.split("\n").map(renderDiffLine).join("\n");
+	return `<details class="file-diff"${openByDefault ? " open" : ""}>
+					<summary>Diff</summary>
+					<pre class="diff-pre">${body}</pre>
+				</details>`;
+}
+
+function renderFileCard(
+	entry: DiffStatEntry,
+	reason: string | undefined,
+	maxChanged: number,
+	diff: string | undefined,
+): string {
 	const addedWidth = (entry.added / maxChanged) * 100;
 	const removedWidth = (entry.removed / maxChanged) * 100;
 	const { dir, name } = splitPath(entry.file);
@@ -99,6 +152,7 @@ function renderFileCard(entry: DiffStatEntry, reason: string | undefined, maxCha
 				</div>
 				${reason ? `<p class="file-reason">${escapeHtml(reason)}</p>` : ""}
 				<div class="file-bar"><span class="file-bar-added" style="width:${addedWidth}%"></span><span class="file-bar-removed" style="width:${removedWidth}%"></span></div>
+				${renderDiffBlock(diff, reason !== undefined)}
 			</li>`;
 }
 
@@ -108,7 +162,7 @@ function renderFileCard(entry: DiffStatEntry, reason: string | undefined, maxCha
  * Files with a stated reason lead with it and carry an accent border; files without one sit back,
  * quieter — so what actually matters reads first. Matches the Forest Night theme.
  */
-export function renderDashboardHtml({ pr, jiraUrl, diffStat }: DashboardInput): string {
+export function renderDashboardHtml({ pr, jiraUrl, diffStat, fileDiffs }: DashboardInput): string {
 	const changes = parseChangesSection(pr.body);
 	const overview = parseOverview(pr.body);
 	const maxChanged = Math.max(1, ...diffStat.map((e) => e.added + e.removed));
@@ -125,7 +179,9 @@ export function renderDashboardHtml({ pr, jiraUrl, diffStat }: DashboardInput): 
 		return aHas !== bHas ? aHas - bHas : a.file.localeCompare(b.file);
 	});
 
-	const cards = sorted.map((entry) => renderFileCard(entry, changes.get(entry.file), maxChanged)).join("\n");
+	const cards = sorted
+		.map((entry) => renderFileCard(entry, changes.get(entry.file), maxChanged, fileDiffs.get(entry.file)))
+		.join("\n");
 
 	const jiraKey = jiraUrl ? (/\/browse\/([^/]+)$/.exec(jiraUrl)?.[1] ?? "Jira") : null;
 	const jiraPill = jiraUrl
@@ -213,6 +269,23 @@ export function renderDashboardHtml({ pr, jiraUrl, diffStat }: DashboardInput): 
 	}
 	.file-bar-added { background: var(--green); height: 100%; }
 	.file-bar-removed { background: var(--red); height: 100%; }
+
+	.file-diff { margin-top: 12px; }
+	.file-diff summary {
+		cursor: pointer; font-size: 12px; color: var(--muted); font-family: var(--font-mono);
+		user-select: none;
+	}
+	.file-diff summary:hover { color: var(--text); }
+	.file-diff[open] summary { margin-bottom: 8px; }
+	.diff-pre {
+		margin: 0; padding: 12px 14px; background: var(--surface-quiet); border: 1px solid var(--border);
+		border-radius: 8px; overflow-x: auto; font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+	}
+	.diff-line { display: block; white-space: pre; }
+	.diff-line.add { color: var(--green); background: rgba(126, 231, 135, 0.08); }
+	.diff-line.rem { color: var(--red); background: rgba(255, 107, 107, 0.08); }
+	.diff-line.ctx { color: var(--muted); }
+	.diff-line.hunk { color: var(--aqua); opacity: 0.8; margin: 4px 0; }
 
 	footer { font-size: 12px; color: var(--dim); text-align: center; }
 </style>

@@ -83,6 +83,22 @@ function resolveBranchWithGitAsync(repoDir: string): Promise<string | null> {
 	});
 }
 
+/**
+ * The `owner/repo` slug of the `origin` remote, parsed from its URL (SSH or HTTPS). On a fork, `gh pr
+ * view` with no `--repo` can resolve against the upstream parent instead of `origin` — passing this
+ * slug explicitly keeps PR/Jira/dashboard lookups pinned to the repo the branch was actually pushed to.
+ */
+function resolveOriginRepoSlug(repoDir: string): string | null {
+	const result = spawnSync("git", ["remote", "get-url", "origin"], {
+		cwd: repoDir,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	if (result.status !== 0) return null;
+	const match = /github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?\/?$/.exec(result.stdout.trim());
+	return match?.[1] ?? null;
+}
+
 export type PullRequestInfo = {
 	url: string;
 	title: string;
@@ -92,15 +108,21 @@ export type PullRequestInfo = {
 };
 
 /**
- * Ask `gh` for the current branch's open pull request (URL, title, body, base branch, number). Null if
- * there isn't one, or `gh` is unavailable. Fetches everything the Jira-key fallback and PR dashboard need
- * in one call, rather than a separate `gh` round trip for each.
+ * Ask `gh` for `branch`'s open pull request (URL, title, body, base branch, number). Null if there isn't
+ * one, or `gh` is unavailable. Fetches everything the Jira-key fallback and PR dashboard need in one
+ * call, rather than a separate `gh` round trip for each.
  */
-function resolvePullRequestInfo(repoDir: string): Promise<PullRequestInfo | null> {
+function resolvePullRequestInfo(repoDir: string, branch: string): Promise<PullRequestInfo | null> {
+	const repoSlug = resolveOriginRepoSlug(repoDir);
+	// `--repo` requires an explicit branch argument: it disables gh's own current-branch detection,
+	// which (on a fork) can resolve against the upstream parent repo instead of `origin`.
+	const args = repoSlug
+		? ["pr", "view", branch, "--repo", repoSlug, "--json", "url,title,body,baseRefName,number"]
+		: ["pr", "view", "--json", "url,title,body,baseRefName,number"];
 	return new Promise((resolvePromise) => {
 		execFile(
 			"gh",
-			["pr", "view", "--json", "url,title,body,baseRefName,number"],
+			args,
 			{ cwd: repoDir, encoding: "utf8", timeout: 5000 },
 			(error: ExecFileException | null, stdout: string) => {
 				if (error) {
@@ -217,10 +239,12 @@ export class FooterDataProvider {
 	private ensurePrInfoFetch(isPoll = false): void {
 		if (this.prFetchInFlight || !this.gitPaths) return;
 		if (this.cachedPrInfo !== undefined && !isPoll) return;
+		const branch = this.getGitBranch();
+		if (!branch || branch === "detached") return;
 		this.prFetchInFlight = true;
 		const repoDir = this.gitPaths.repoDir;
 		const hadNoPrYet = this.cachedPrInfo === null;
-		void resolvePullRequestInfo(repoDir).then(async (info) => {
+		void resolvePullRequestInfo(repoDir, branch).then(async (info) => {
 			this.prFetchInFlight = false;
 			if (this.disposed) return;
 			const isNewlyCreated = hadNoPrYet && info !== null;

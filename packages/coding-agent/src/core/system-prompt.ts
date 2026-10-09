@@ -119,6 +119,11 @@ function buildRules(
 		for (const rule of toolGuidelines[name] ?? []) addRule(rule);
 	}
 	for (const rule of promptGuidelines) addRule(rule);
+	if (hasBash) {
+		addRule(
+			'When opening a pull request with `gh pr create`, include a "## Changes" section in the body: one bullet per changed file, formatted `path`: reason, stating only why that file changed (terse, skip files where the reason is obvious from the title)',
+		);
+	}
 	addRule("Be concise in your responses");
 	addRule("Show file paths clearly when working with files");
 	return rules.map((rule) => `- ${rule}`).join("\n");

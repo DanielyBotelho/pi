@@ -17,6 +17,7 @@ import type { ToolDefinition, ToolRenderContext, ToolRenderers } from "../../../
 export type { ToolRenderers };
 
 import { formatToolCallWithArgs, getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
+import { stripAnsi } from "../../../utils/ansi.ts";
 import { ensurePngTranscoder } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
 import { keyHint } from "./keybinding-hints.ts";
@@ -341,10 +342,16 @@ export class ToolExecutionComponent extends Container {
 	 */
 	private getCollapsedCallSummary(width: number): string | undefined {
 		const component = this.callRendererComponent ?? this.createCallFallback();
-		return component
+		const nonEmptyLines = component
 			.render(width)
 			.map((l) => l.trimEnd())
-			.find((l) => l.length > 0);
+			.filter((l) => l.length > 0);
+		const [firstLine, secondLine] = nonEmptyLines;
+		if (firstLine === undefined) return undefined;
+		// Some renderers (e.g. codemode) put only the bare tool name on the first line and the actual
+		// detail (the script) on the second — pull that second line in too, or the summary is useless.
+		const isBareTitle = stripAnsi(firstLine).trim().toLowerCase() === this.toolName.toLowerCase();
+		return isBareTitle && secondLine ? `${firstLine} ${secondLine}` : firstLine;
 	}
 
 	private updateDisplay(): void {

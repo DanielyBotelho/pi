@@ -1,7 +1,10 @@
 import { type ExecFileException, execFile, spawnSync } from "child_process";
 import { existsSync, type FSWatcher, readFileSync, type Stats, statSync, unwatchFile, watchFile } from "fs";
-import { dirname, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
+import { pathToFileURL } from "url";
 import { closeWatcher, FS_WATCH_RETRY_DELAY_MS, watchWithErrorHandler } from "../utils/fs-watch.ts";
+import { openBrowser } from "../utils/open-browser.ts";
+import { getDiffStat, renderDashboardHtml, writeDashboardFile } from "./pr-dashboard.ts";
 
 export type GitPaths = {
 	repoDir: string;
@@ -84,18 +87,20 @@ export type PullRequestInfo = {
 	url: string;
 	title: string;
 	body: string;
+	baseRefName: string;
+	number: number;
 };
 
 /**
- * Ask `gh` for the current branch's open pull request (URL, title, body). Null if there isn't one, or
- * `gh` is unavailable. Fetches title/body alongside the URL so the Jira-key fallback below doesn't need
- * a second `gh` call.
+ * Ask `gh` for the current branch's open pull request (URL, title, body, base branch, number). Null if
+ * there isn't one, or `gh` is unavailable. Fetches everything the Jira-key fallback and PR dashboard need
+ * in one call, rather than a separate `gh` round trip for each.
  */
 function resolvePullRequestInfo(repoDir: string): Promise<PullRequestInfo | null> {
 	return new Promise((resolvePromise) => {
 		execFile(
 			"gh",
-			["pr", "view", "--json", "url,title,body"],
+			["pr", "view", "--json", "url,title,body,baseRefName,number"],
 			{ cwd: repoDir, encoding: "utf8", timeout: 5000 },
 			(error: ExecFileException | null, stdout: string) => {
 				if (error) {
@@ -103,9 +108,23 @@ function resolvePullRequestInfo(repoDir: string): Promise<PullRequestInfo | null
 					return;
 				}
 				try {
-					const parsed = JSON.parse(stdout) as { url?: string; title?: string; body?: string };
+					const parsed = JSON.parse(stdout) as {
+						url?: string;
+						title?: string;
+						body?: string;
+						baseRefName?: string;
+						number?: number;
+					};
 					resolvePromise(
-						parsed.url ? { url: parsed.url, title: parsed.title ?? "", body: parsed.body ?? "" } : null,
+						parsed.url && parsed.number !== undefined
+							? {
+									url: parsed.url,
+									title: parsed.title ?? "",
+									body: parsed.body ?? "",
+									baseRefName: parsed.baseRefName ?? "main",
+									number: parsed.number,
+								}
+							: null,
 					);
 				} catch {
 					resolvePromise(null);
@@ -153,6 +172,9 @@ export class FooterDataProvider {
 	private cachedBranch: string | null | undefined = undefined;
 	private cachedPrInfo: PullRequestInfo | null | undefined = undefined;
 	private prFetchInFlight = false;
+	private prPollTimer: ReturnType<typeof setTimeout> | null = null;
+	private static readonly PR_POLL_MS = 20_000;
+	private cachedDashboardPath: string | null = null;
 	private gitPaths: GitPaths | null | undefined = undefined;
 	private headWatcher: FSWatcher | null = null;
 	private headWatchFilePath: string | null = null;
@@ -183,26 +205,68 @@ export class FooterDataProvider {
 	}
 
 	/**
-	 * Kicks off (once) a background fetch of the current branch's pull request via `gh pr view`, and
-	 * notifies branch-change subscribers once it resolves. `getPullRequestUrl` and `getJiraUrl` share
-	 * this fetch since the Jira-key fallback reads the PR title/body fetched alongside its URL.
+	 * Kicks off a background fetch of the current branch's pull request via `gh pr view`, and notifies
+	 * branch-change subscribers once it resolves. `getPullRequestUrl` and `getJiraUrl` share this fetch
+	 * since the Jira-key fallback reads the PR title/body fetched alongside its URL.
+	 *
+	 * While no PR exists yet, re-polls every `PR_POLL_MS` so a PR opened mid-session (e.g. the agent
+	 * running `gh pr create`) is picked up without restarting pi. A PR found on the *first* check (one
+	 * that already existed before this session started) does not auto-open its dashboard; one found by
+	 * a later poll (created during this session) does.
 	 */
-	private ensurePrInfoFetch(): void {
-		if (this.cachedPrInfo !== undefined || this.prFetchInFlight || !this.gitPaths) return;
+	private ensurePrInfoFetch(isPoll = false): void {
+		if (this.prFetchInFlight || !this.gitPaths) return;
+		if (this.cachedPrInfo !== undefined && !isPoll) return;
 		this.prFetchInFlight = true;
-		void resolvePullRequestInfo(this.gitPaths.repoDir).then((info) => {
+		const repoDir = this.gitPaths.repoDir;
+		const hadNoPrYet = this.cachedPrInfo === null;
+		void resolvePullRequestInfo(repoDir).then(async (info) => {
 			this.prFetchInFlight = false;
 			if (this.disposed) return;
-			const changed = this.cachedPrInfo !== undefined && this.cachedPrInfo?.url !== info?.url;
+			const isNewlyCreated = hadNoPrYet && info !== null;
+			const urlChanged = this.cachedPrInfo !== undefined && this.cachedPrInfo?.url !== info?.url;
 			this.cachedPrInfo = info;
-			if (changed) this.notifyBranchChange();
+			if (info) {
+				await this.generateDashboard(repoDir, info, isNewlyCreated);
+			} else {
+				this.schedulePrPoll();
+			}
+			if (urlChanged || isNewlyCreated) this.notifyBranchChange();
 		});
+	}
+
+	private schedulePrPoll(): void {
+		if (this.disposed || this.prPollTimer) return;
+		this.prPollTimer = setTimeout(() => {
+			this.prPollTimer = null;
+			this.ensurePrInfoFetch(true);
+		}, FooterDataProvider.PR_POLL_MS);
+		this.prPollTimer.unref?.();
+	}
+
+	/** Builds the PR dashboard HTML, writes it to a temp file, and opens it in the browser if `autoOpen`. */
+	private async generateDashboard(repoDir: string, info: PullRequestInfo, autoOpen: boolean): Promise<void> {
+		try {
+			const diffStat = await getDiffStat(repoDir, info.baseRefName);
+			const html = renderDashboardHtml({ pr: info, jiraUrl: this.getJiraUrl(), diffStat });
+			const repoSlug = basename(repoDir).replace(/[^a-zA-Z0-9_-]/g, "_") || "repo";
+			const path = writeDashboardFile(repoSlug, info.number, html);
+			this.cachedDashboardPath = path;
+			if (autoOpen) openBrowser(pathToFileURL(path).href);
+		} catch {
+			// Best-effort: the dashboard link simply won't appear if this fails.
+		}
 	}
 
 	/** URL of the open pull request for the current branch, null if there isn't one (or `gh` isn't available). */
 	getPullRequestUrl(): string | null {
 		this.ensurePrInfoFetch();
 		return this.cachedPrInfo?.url ?? null;
+	}
+
+	/** `file://` URL of the generated PR dashboard, null until one has been generated for an open PR. */
+	getDashboardUrl(): string | null {
+		return this.cachedDashboardPath ? pathToFileURL(this.cachedDashboardPath).href : null;
 	}
 
 	/**
@@ -266,9 +330,14 @@ export class FooterDataProvider {
 			clearTimeout(this.refreshTimer);
 			this.refreshTimer = null;
 		}
+		if (this.prPollTimer) {
+			clearTimeout(this.prPollTimer);
+			this.prPollTimer = null;
+		}
 		this.clearGitWatchers();
 		this.cachedBranch = undefined;
 		this.cachedPrInfo = undefined;
+		this.cachedDashboardPath = null;
 		this.gitPaths = findGitPaths(cwd);
 		this.setupGitWatcher();
 		this.notifyBranchChange();
@@ -280,6 +349,10 @@ export class FooterDataProvider {
 		if (this.refreshTimer) {
 			clearTimeout(this.refreshTimer);
 			this.refreshTimer = null;
+		}
+		if (this.prPollTimer) {
+			clearTimeout(this.prPollTimer);
+			this.prPollTimer = null;
 		}
 		this.clearGitWatchers();
 		this.branchChangeCallbacks.clear();
@@ -315,6 +388,11 @@ export class FooterDataProvider {
 			if (this.cachedBranch !== undefined && this.cachedBranch !== nextBranch) {
 				this.cachedBranch = nextBranch;
 				this.cachedPrInfo = undefined;
+				this.cachedDashboardPath = null;
+				if (this.prPollTimer) {
+					clearTimeout(this.prPollTimer);
+					this.prPollTimer = null;
+				}
 				this.notifyBranchChange();
 				return;
 			}
@@ -479,6 +557,7 @@ export type ReadonlyFooterDataProvider = Pick<
 	| "getGitBranch"
 	| "getPullRequestUrl"
 	| "getJiraUrl"
+	| "getDashboardUrl"
 	| "getExtensionStatuses"
 	| "getAvailableProviderCount"
 	| "onBranchChange"

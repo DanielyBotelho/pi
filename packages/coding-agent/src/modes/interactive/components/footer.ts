@@ -184,6 +184,12 @@ export class FooterComponent implements Component {
 				const jiraKey = /\/browse\/([^/]+)$/.exec(jiraUrl)?.[1] ?? "Jira";
 				pwdLineRaw += `${theme.fg("dim", " · ")}${theme.fg("syntaxType", hyperlink(jiraKey, jiraUrl))}`;
 			}
+
+			// Add a link to the generated PR dashboard (diffstat + per-file reasons), once one exists
+			const dashboardUrl = this.footerData.getDashboardUrl();
+			if (dashboardUrl) {
+				pwdLineRaw += `${theme.fg("dim", " · ")}${theme.fg("success", hyperlink("Dashboard", dashboardUrl))}`;
+			}
 		}
 
 		// Add session name if set

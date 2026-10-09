@@ -297,13 +297,15 @@ export class FooterComponent implements Component {
 		const pwdLine = truncateToWidth(pwdLineRaw, width, theme.fg("dim", "..."));
 		const lines = [pwdLine, dimStatsLeft + dimRemainder];
 
-		// Add extension statuses on a single line, sorted by key alphabetically
+		// Add extension statuses on a single line, sorted by key alphabetically. Extensions color their
+		// own status text (many call ctx.ui.theme.fg themselves), so join with a dim separator instead
+		// of wrapping the whole line in one color, which would clobber those colors.
 		const extensionStatuses = this.footerData.getExtensionStatuses();
 		if (extensionStatuses.size > 0) {
 			const sortedStatuses = Array.from(extensionStatuses.entries())
 				.sort(([a], [b]) => a.localeCompare(b))
 				.map(([, text]) => sanitizeStatusText(text));
-			const statusLine = sortedStatuses.join(" ");
+			const statusLine = sortedStatuses.join(theme.fg("dim", " · "));
 			// Truncate to terminal width with dim ellipsis for consistency with footer style
 			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
 		}

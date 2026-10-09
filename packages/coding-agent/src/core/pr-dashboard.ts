@@ -72,9 +72,41 @@ export interface DashboardInput {
 	diffStat: DiffStatEntry[];
 }
 
+/** Splits a path into its directory (trailing slash kept) and final segment. */
+function splitPath(path: string): { dir: string; name: string } {
+	const index = path.lastIndexOf("/");
+	return index === -1 ? { dir: "", name: path } : { dir: path.slice(0, index + 1), name: path.slice(index + 1) };
+}
+
+/** Keeps only the last few directory segments, so deep paths don't crowd out the filename. */
+function shortenDir(dir: string, maxSegments = 3): string {
+	const segments = dir.split("/").filter(Boolean);
+	if (segments.length === 0) return "";
+	if (segments.length <= maxSegments) return `${segments.join("/")}/`;
+	return `.../${segments.slice(-maxSegments).join("/")}/`;
+}
+
+function renderFileCard(entry: DiffStatEntry, reason: string | undefined, maxChanged: number): string {
+	const addedWidth = (entry.added / maxChanged) * 100;
+	const removedWidth = (entry.removed / maxChanged) * 100;
+	const { dir, name } = splitPath(entry.file);
+	const shortDir = shortenDir(dir);
+
+	return `<li class="file-card${reason ? " has-reason" : ""}">
+				<div class="file-card-top">
+					<span class="file-path">${shortDir ? `<span class="file-dir">${escapeHtml(shortDir)}</span>` : ""}${escapeHtml(name)}</span>
+					<span class="file-stat"><span class="added">+${entry.added}</span><span class="removed">−${entry.removed}</span></span>
+				</div>
+				${reason ? `<p class="file-reason">${escapeHtml(reason)}</p>` : ""}
+				<div class="file-bar"><span class="file-bar-added" style="width:${addedWidth}%"></span><span class="file-bar-removed" style="width:${removedWidth}%"></span></div>
+			</li>`;
+}
+
 /**
- * Renders a small, self-contained "PR dashboard" page: diffstat per changed file, plus its stated
- * reason from the PR body's `## Changes` section when there is one. Matches the Forest Night theme.
+ * Renders a polished, self-contained "PR dashboard" page: every changed file, each one's stated reason
+ * from the PR body's `## Changes` section when there is one, and the shape of the diff at a glance.
+ * Files with a stated reason lead with it and carry an accent border; files without one sit back,
+ * quieter — so what actually matters reads first. Matches the Forest Night theme.
  */
 export function renderDashboardHtml({ pr, jiraUrl, diffStat }: DashboardInput): string {
 	const changes = parseChangesSection(pr.body);
@@ -82,26 +114,24 @@ export function renderDashboardHtml({ pr, jiraUrl, diffStat }: DashboardInput): 
 	const maxChanged = Math.max(1, ...diffStat.map((e) => e.added + e.removed));
 	const totalAdded = diffStat.reduce((sum, e) => sum + e.added, 0);
 	const totalRemoved = diffStat.reduce((sum, e) => sum + e.removed, 0);
+	const totalChanged = Math.max(1, totalAdded + totalRemoved);
+	const explainedCount = diffStat.filter((e) => changes.has(e.file)).length;
 
-	const rows = diffStat
-		.map((entry) => {
-			const reason = changes.get(entry.file);
-			const addedWidth = Math.round((entry.added / maxChanged) * 100);
-			const removedWidth = Math.round((entry.removed / maxChanged) * 100);
-			return `<tr>
-				<td class="file">${escapeHtml(entry.file)}</td>
-				<td class="stat added">+${entry.added}</td>
-				<td class="stat removed">-${entry.removed}</td>
-				<td class="bar"><span class="bar-added" style="width:${addedWidth}%"></span><span class="bar-removed" style="width:${removedWidth}%"></span></td>
-				<td class="why">${reason ? escapeHtml(reason) : ""}</td>
-			</tr>`;
-		})
-		.join("\n");
+	// Files with a stated reason first — that's the part worth scanning — then the rest, both
+	// alphabetically within their group so the list stays predictable as the PR changes.
+	const sorted = [...diffStat].sort((a, b) => {
+		const aHas = changes.has(a.file) ? 0 : 1;
+		const bHas = changes.has(b.file) ? 0 : 1;
+		return aHas !== bHas ? aHas - bHas : a.file.localeCompare(b.file);
+	});
+
+	const cards = sorted.map((entry) => renderFileCard(entry, changes.get(entry.file), maxChanged)).join("\n");
 
 	const jiraKey = jiraUrl ? (/\/browse\/([^/]+)$/.exec(jiraUrl)?.[1] ?? "Jira") : null;
-	const jiraLink = jiraUrl
+	const jiraPill = jiraUrl
 		? `<a class="pill pill-jira" href="${escapeHtml(jiraUrl)}" target="_blank" rel="noopener">${escapeHtml(jiraKey ?? "Jira")}</a>`
 		: "";
+	const fileWord = diffStat.length === 1 ? "file" : "files";
 
 	return `<!doctype html>
 <html lang="en">
@@ -111,53 +141,113 @@ export function renderDashboardHtml({ pr, jiraUrl, diffStat }: DashboardInput): 
 <title>${escapeHtml(pr.title)}</title>
 <style>
 	:root {
-		--bg: #121d1c; --text: #e6ece9; --muted: #8fa39c;
+		--bg: #121d1c; --surface: #16221f; --surface-quiet: #141e1b; --border: #22332e;
+		--text: #e6ece9; --muted: #8fa39c; --dim: #5f7872;
 		--gold: #ffb347; --aqua: #5ee6c4; --green: #7ee787; --red: #ff6b6b; --orange: #ffa368;
-		--border: #22332e;
+		--font-sans: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+		--font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 	}
 	* { box-sizing: border-box; }
 	body {
-		margin: 0; background: var(--bg); color: var(--text); padding: 32px;
-		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		margin: 0; background: var(--bg); color: var(--text); font-family: var(--font-sans);
+		padding: clamp(24px, 5vw, 56px);
 	}
-	.wrap { max-width: 920px; margin: 0 auto; }
-	h1 { font-size: 20px; margin: 0 0 10px; text-wrap: balance; }
+	.page { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+
+	.eyebrow {
+		font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim);
+		font-weight: 600; margin: 0 0 8px;
+	}
+	h1 { font-size: clamp(22px, 3vw, 28px); line-height: 1.25; margin: 0 0 14px; text-wrap: balance; }
+	.pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
 	.pill {
-		display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px;
-		text-decoration: none; margin-right: 6px;
+		display: inline-flex; align-items: center; gap: 5px; padding: 4px 12px; border-radius: 999px;
+		font-size: 12.5px; font-weight: 500; text-decoration: none; font-family: var(--font-mono);
 	}
-	.pill-pr { background: rgba(94, 230, 196, 0.15); color: var(--aqua); }
-	.pill-jira { background: rgba(255, 163, 104, 0.15); color: var(--orange); }
-	.overview { color: var(--muted); font-size: 13px; margin: 16px 0 24px; white-space: pre-wrap; max-width: 70ch; }
-	.totals { font-size: 13px; margin-bottom: 12px; }
-	.totals .added { color: var(--green); }
-	.totals .removed { color: var(--red); }
-	table { width: 100%; border-collapse: collapse; font-size: 13px; }
-	td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
-	.file { color: var(--gold); white-space: nowrap; }
-	.stat.added { color: var(--green); text-align: right; }
-	.stat.removed { color: var(--red); text-align: right; }
-	.bar { width: 110px; }
-	.bar-added, .bar-removed { display: inline-block; height: 8px; }
-	.bar-added { background: var(--green); }
-	.bar-removed { background: var(--red); }
-	.why { color: var(--text); }
+	.pill-pr { background: rgba(94, 230, 196, 0.13); color: var(--aqua); }
+	.pill-jira { background: rgba(255, 163, 104, 0.13); color: var(--orange); }
+	.overview {
+		color: var(--muted); font-size: 14.5px; line-height: 1.6; white-space: pre-wrap; max-width: 62ch;
+		margin: 0;
+	}
+
+	.summary {
+		display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+		padding: 16px 18px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+	}
+	.summary-stat { display: flex; flex-direction: column; gap: 2px; }
+	.summary-stat .num { font-family: var(--font-mono); font-size: 17px; font-weight: 600; }
+	.summary-stat .num.added { color: var(--green); }
+	.summary-stat .num.removed { color: var(--red); }
+	.summary-stat .label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; }
+	.summary-bar {
+		flex: 1 1 140px; min-width: 100px; height: 6px; border-radius: 3px; overflow: hidden;
+		display: flex; background: var(--border);
+	}
+	.summary-bar-added { background: var(--green); height: 100%; }
+	.summary-bar-removed { background: var(--red); height: 100%; }
+
+	.section-label {
+		font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--dim);
+		font-weight: 600; margin: 0;
+	}
+	.file-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+	.file-card {
+		background: var(--surface-quiet); border: 1px solid var(--border); border-radius: 10px;
+		padding: 13px 16px; border-left: 3px solid transparent;
+	}
+	.file-card.has-reason { background: var(--surface); border-left-color: var(--gold); }
+	.file-card-top {
+		display: flex; justify-content: space-between; align-items: baseline; gap: 14px; flex-wrap: wrap;
+	}
+	.file-path { font-family: var(--font-mono); font-size: 12.5px; color: var(--muted); word-break: break-all; }
+	.file-card.has-reason .file-path { color: var(--text); }
+	.file-dir { color: var(--dim); }
+	.file-stat { font-family: var(--font-mono); font-size: 12px; white-space: nowrap; }
+	.file-stat .added { color: var(--green); }
+	.file-stat .removed { color: var(--red); margin-left: 7px; }
+	.file-reason { margin: 8px 0 0; font-size: 14.5px; line-height: 1.5; color: var(--text); }
+	.file-bar {
+		height: 4px; border-radius: 2px; overflow: hidden; display: flex; margin-top: 10px;
+		background: var(--border);
+	}
+	.file-bar-added { background: var(--green); height: 100%; }
+	.file-bar-removed { background: var(--red); height: 100%; }
+
+	footer { font-size: 12px; color: var(--dim); text-align: center; }
 </style>
 </head>
 <body>
-	<div class="wrap">
-		<h1>${escapeHtml(pr.title)}</h1>
-		<div>
-			<a class="pill pill-pr" href="${escapeHtml(pr.url)}" target="_blank" rel="noopener">${escapeHtml(pr.url)}</a>
-			${jiraLink}
-		</div>
-		${overview ? `<div class="overview">${escapeHtml(overview)}</div>` : ""}
-		<div class="totals"><span class="added">+${totalAdded}</span> <span class="removed">-${totalRemoved}</span> · ${diffStat.length} file${diffStat.length === 1 ? "" : "s"} changed</div>
-		<table>
-			<tbody>
-				${rows || '<tr><td colspan="5" class="why">No diffstat available.</td></tr>'}
-			</tbody>
-		</table>
+	<div class="page">
+		<header>
+			<p class="eyebrow">Pull request #${pr.number}</p>
+			<h1>${escapeHtml(pr.title)}</h1>
+			<div class="pills">
+				<a class="pill pill-pr" href="${escapeHtml(pr.url)}" target="_blank" rel="noopener">View on GitHub</a>
+				${jiraPill}
+			</div>
+			${overview ? `<p class="overview">${escapeHtml(overview)}</p>` : ""}
+		</header>
+
+		<section class="summary">
+			<div class="summary-stat"><span class="num added">+${totalAdded}</span><span class="label">Added</span></div>
+			<div class="summary-stat"><span class="num removed">−${totalRemoved}</span><span class="label">Removed</span></div>
+			<div class="summary-stat"><span class="num">${diffStat.length}</span><span class="label">${fileWord}</span></div>
+			<div class="summary-bar">
+				<span class="summary-bar-added" style="width:${(totalAdded / totalChanged) * 100}%"></span>
+				<span class="summary-bar-removed" style="width:${(totalRemoved / totalChanged) * 100}%"></span>
+			</div>
+			${explainedCount > 0 ? `<div class="summary-stat"><span class="num">${explainedCount}/${diffStat.length}</span><span class="label">Explained</span></div>` : ""}
+		</section>
+
+		<section>
+			<p class="section-label">Changes</p>
+			<ul class="file-list">
+				${cards || '<li class="file-card">No diffstat available.</li>'}
+			</ul>
+		</section>
+
+		<footer>Generated by pi · ${new Date().toLocaleString()}</footer>
 	</div>
 </body>
 </html>

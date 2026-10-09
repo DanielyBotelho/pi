@@ -78,7 +78,9 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		},
 		sessionManager: { getCwd: () => process.cwd(), getEntries: () => [] },
 		session: { retryAttempt: 0, modelRegistry: { find: () => undefined } },
-		toolOutputExpanded: false,
+		// Expanded so this test's render-content assertions see the actual result text, not just the
+		// collapsed one-line status — this test is about pending-tool bookkeeping, not the collapse UI.
+		toolOutputExpanded: true,
 		isInitialized: true,
 		updateEditorBorderColor: vi.fn(),
 		getRegisteredToolDefinition: (_toolName: string) => undefined,

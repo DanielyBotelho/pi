@@ -9,6 +9,7 @@ import {
 	Text,
 	type TUI,
 	type TuiMouseEvent,
+	truncateToWidth,
 } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderers } from "../../../core/extensions/types.ts";
 
@@ -21,6 +22,13 @@ import { theme } from "../theme/theme.ts";
 import { keyHint } from "./keybinding-hints.ts";
 
 const FALLBACK_PREVIEW_LINES = 10;
+
+/** The row the minimized one-line summary renders on, below the component's own leading blank line. */
+const MINIMIZED_CONTENT_ROW = 1;
+
+function formatDurationMs(durationMs: number): string {
+	return durationMs < 1000 ? `${Math.round(durationMs)}ms` : `${(durationMs / 1000).toFixed(1)}s`;
+}
 
 export interface ToolExecutionOptions {
 	showImages?: boolean;
@@ -229,6 +237,16 @@ export class ToolExecutionComponent extends Container {
 			return [];
 		}
 
+		if (!this.expanded) {
+			// A self-rendering tool that deliberately draws nothing stays invisible when collapsed too.
+			if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
+				const selfLines = this.selfRenderContainer.render(width);
+				if (selfLines.length === 0 && this.imageComponents.length === 0) return [];
+			}
+			// Images are usually the point of the call, not noise, so they still show when collapsed.
+			return ["", ...this.renderMinimizedLine(width), ...this.renderImages(width)];
+		}
+
 		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
 			const contentLines = this.selfRenderContainer.render(width);
 			this.selfRenderHeight = contentLines.length;
@@ -241,16 +259,7 @@ export class ToolExecutionComponent extends Container {
 				lines.push("");
 				lines.push(...contentLines);
 			}
-			for (let i = 0; i < this.imageComponents.length; i++) {
-				const spacer = this.imageSpacers[i];
-				if (spacer) {
-					lines.push(...spacer.render(width));
-				}
-				const imageComponent = this.imageComponents[i];
-				if (imageComponent) {
-					lines.push(...imageComponent.render(width));
-				}
-			}
+			lines.push(...this.renderImages(width));
 			return lines;
 		}
 
@@ -258,6 +267,15 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
+		if (!this.expanded) {
+			if (this.hideComponent || event.type !== "click" || event.y !== MINIMIZED_CONTENT_ROW) return undefined;
+			this.setExpanded(true);
+			this.ui.requestRender();
+			return {
+				handled: true,
+				target: { component: this, originX: 0, originY: MINIMIZED_CONTENT_ROW, width: event.width, height: 1 },
+			};
+		}
 		if (!this.hasRendererDefinition() || this.getRenderShell() !== "self") return super.handleMouse(event);
 		if (event.y <= 0 || event.y > this.selfRenderHeight) return undefined;
 		return this.selfRenderContainer.handleMouse({
@@ -265,6 +283,68 @@ export class ToolExecutionComponent extends Container {
 			y: event.y - 1,
 			height: this.selfRenderHeight,
 		});
+	}
+
+	private renderImages(width: number): string[] {
+		const lines: string[] = [];
+		for (let i = 0; i < this.imageComponents.length; i++) {
+			const spacer = this.imageSpacers[i];
+			if (spacer) {
+				lines.push(...spacer.render(width));
+			}
+			const imageComponent = this.imageComponents[i];
+			if (imageComponent) {
+				lines.push(...imageComponent.render(width));
+			}
+		}
+		return lines;
+	}
+
+	/**
+	 * One-line status for the collapsed (default) state: icon + whatever the tool's own call
+	 * rendering already shows as its first line (e.g. "read resource X", "[skill] foo:1-20", a bash
+	 * command), duration once finished, and the first line of output when it's an error (kept visible
+	 * even collapsed). Click, or ctrl+o, expands to the tool's full rendered output. Deliberately skips
+	 * the result rendering here — that's the bulk of what made collapsed tool calls noisy before.
+	 */
+	private renderMinimizedLine(width: number): string[] {
+		const icon = this.isPartial
+			? theme.fg("accent", "◌")
+			: this.result?.isError
+				? theme.fg("error", "✗")
+				: theme.fg("success", "✓");
+
+		const summary = this.getCollapsedCallSummary(width) ?? theme.fg("toolTitle", this.toolName);
+		let line = `${icon} ${summary}`;
+
+		const metaSegments: string[] = [];
+		if (!this.isPartial && this.result?.durationMs !== undefined) {
+			metaSegments.push(theme.fg("dim", formatDurationMs(this.result.durationMs)));
+		}
+		if (this.result?.isError) {
+			const errorText = this.getTextOutput()
+				.split("\n")
+				.find((l) => l.trim().length > 0);
+			if (errorText) metaSegments.push(theme.fg("error", errorText));
+		}
+		if (metaSegments.length > 0) line += theme.fg("dim", " · ") + metaSegments.join(theme.fg("dim", " · "));
+
+		const pad = " ".repeat(this.outputPad);
+		return [truncateToWidth(`${pad}${line}`, width, theme.fg("dim", "..."))];
+	}
+
+	/**
+	 * First non-empty line of the tool's own call component, which updateDisplay() already built (not
+	 * re-invoked here, so no duplicate renderCall() call and no risk to shared renderer state). Falls
+	 * back to the generic fallback when there's no custom renderCall (callRendererComponent is only
+	 * set in that branch of updateDisplay()).
+	 */
+	private getCollapsedCallSummary(width: number): string | undefined {
+		const component = this.callRendererComponent ?? this.createCallFallback();
+		return component
+			.render(width)
+			.map((l) => l.trimEnd())
+			.find((l) => l.length > 0);
 	}
 
 	private updateDisplay(): void {

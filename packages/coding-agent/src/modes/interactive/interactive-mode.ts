@@ -139,6 +139,7 @@ import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
+import { CAT_ART_COLUMNS, CAT_ART_ROWS, renderCatArt } from "./components/cat-logo.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -160,7 +161,7 @@ import {
 	formatAuthSelectorProviderType,
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.ts";
-import { piLogoLines, piWordmark, supportsPiLogo } from "./components/pi-logo.ts";
+import { piWordmark, supportsPiLogo } from "./components/pi-logo.ts";
 import { createLoginMenuSelector } from "./components/radius-login-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
 import { SessionSelectorComponent } from "./components/session-selector.ts";
@@ -253,12 +254,21 @@ class ExpandableText extends ThemedText implements Expandable {
 	}
 }
 
-/** The built-in header. Clicking its logo (the first two lines, after one column of padding) plays an easter egg. */
+/** The built-in header. Clicking its logo (the top-left art, after one column of padding) plays an easter egg. */
 class BuiltInHeader extends ExpandableText {
 	onLogoClick: ((column: number, row: number) => void) | undefined;
+	logoRows = 2;
+	logoColumns = 4;
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		if (event.type !== "click" || event.y > 1 || event.x < 1 || event.x > 4 || !this.onLogoClick) return undefined;
+		if (
+			event.type !== "click" ||
+			event.y >= this.logoRows ||
+			event.x < 1 ||
+			event.x > this.logoColumns ||
+			!this.onLogoClick
+		)
+			return undefined;
 		this.onLogoClick(event.screenX - event.x + 1, event.screenY - event.y);
 		return { handled: true };
 	}
@@ -1008,14 +1018,14 @@ export class InteractiveMode {
 		// Add header with keybindings from config (unless silenced)
 		if (this.shouldShowStartupHeader()) {
 			const showDetails = this.shouldShowStartupDetails();
-			// Built on demand so the header follows theme changes. The logo's first line carries the version,
-			// its second line the first line of key hints. Terminals that cannot render the logo get a
-			// "Pi vX" line instead, with the key hints below it.
+			// Built on demand so the header follows theme changes. The cat art sits above the version and key
+			// hints. Terminals that cannot render the logo get a "Pi vX" line instead, with the hints below it.
 			const showLogo = supportsPiLogo();
+			let shimmerTick = 0;
 			const withLogo = (hints: string) => {
 				if (!showLogo) return `${piWordmark()} ${theme.fg("dim", `v${this.version}`)}\n${hints}`;
-				const [top, bottom] = piLogoLines();
-				return `${top} ${theme.fg("dim", `v${this.version}`)}\n${bottom} ${hints}`;
+				const art = renderCatArt(shimmerTick).join("\n");
+				return `${art}\n${theme.fg("dim", `v${this.version}`)}\n${hints}`;
 			};
 
 			// Build startup instructions using keybinding hint helpers
@@ -1068,7 +1078,17 @@ export class InteractiveMode {
 				1,
 				0,
 			);
-			if (showLogo) header.onLogoClick = (column, row) => playPiLogo3d(this.renderer, column, row);
+			if (showLogo) {
+				header.onLogoClick = (column, row) => playPiLogo3d(this.renderer, column, row);
+				header.logoRows = CAT_ART_ROWS;
+				header.logoColumns = CAT_ART_COLUMNS;
+				// Flowing color shimmer down the cat. unref() so the timer never keeps the process alive.
+				setInterval(() => {
+					shimmerTick++;
+					header.invalidate();
+					this.ui.requestRender();
+				}, 450).unref();
+			}
 			this.builtInHeader = header;
 
 			// Setup UI layout

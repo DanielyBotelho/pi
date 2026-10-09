@@ -80,6 +80,25 @@ function resolveBranchWithGitAsync(repoDir: string): Promise<string | null> {
 	});
 }
 
+/** Ask `gh` for the current branch's open pull request URL. Null if there isn't one, or `gh` is unavailable. */
+function resolvePullRequestUrl(repoDir: string): Promise<string | null> {
+	return new Promise((resolvePromise) => {
+		execFile(
+			"gh",
+			["pr", "view", "--json", "url", "-q", ".url"],
+			{ cwd: repoDir, encoding: "utf8", timeout: 5000 },
+			(error: ExecFileException | null, stdout: string) => {
+				if (error) {
+					resolvePromise(null);
+					return;
+				}
+				const url = stdout.trim();
+				resolvePromise(url || null);
+			},
+		);
+	});
+}
+
 function isWslEnvironment(): boolean {
 	return process.platform === "linux" && !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
 }
@@ -102,6 +121,8 @@ export class FooterDataProvider {
 
 	private extensionStatuses = new Map<string, string>();
 	private cachedBranch: string | null | undefined = undefined;
+	private cachedPrUrl: string | null | undefined = undefined;
+	private prFetchInFlight = false;
 	private gitPaths: GitPaths | null | undefined = undefined;
 	private headWatcher: FSWatcher | null = null;
 	private headWatchFilePath: string | null = null;
@@ -129,6 +150,25 @@ export class FooterDataProvider {
 			this.cachedBranch = this.resolveGitBranchSync();
 		}
 		return this.cachedBranch;
+	}
+
+	/**
+	 * URL of the open pull request for the current branch, null if there isn't one (or `gh` isn't
+	 * available). Undefined until the first call, which kicks off a background fetch via `gh pr view`
+	 * and notifies branch-change subscribers once it resolves.
+	 */
+	getPullRequestUrl(): string | null {
+		if (this.cachedPrUrl === undefined && !this.prFetchInFlight && this.gitPaths) {
+			this.prFetchInFlight = true;
+			void resolvePullRequestUrl(this.gitPaths.repoDir).then((url) => {
+				this.prFetchInFlight = false;
+				if (this.disposed) return;
+				const changed = this.cachedPrUrl !== undefined && this.cachedPrUrl !== url;
+				this.cachedPrUrl = url;
+				if (changed) this.notifyBranchChange();
+			});
+		}
+		return this.cachedPrUrl ?? null;
 	}
 
 	/** Extension status texts set via ctx.ui.setStatus() */
@@ -178,6 +218,7 @@ export class FooterDataProvider {
 		}
 		this.clearGitWatchers();
 		this.cachedBranch = undefined;
+		this.cachedPrUrl = undefined;
 		this.gitPaths = findGitPaths(cwd);
 		this.setupGitWatcher();
 		this.notifyBranchChange();
@@ -223,6 +264,7 @@ export class FooterDataProvider {
 			if (this.disposed) return;
 			if (this.cachedBranch !== undefined && this.cachedBranch !== nextBranch) {
 				this.cachedBranch = nextBranch;
+				this.cachedPrUrl = undefined;
 				this.notifyBranchChange();
 				return;
 			}
@@ -384,5 +426,5 @@ export class FooterDataProvider {
 /** Read-only view for extensions - excludes setExtensionStatus, setAvailableProviderCount and dispose */
 export type ReadonlyFooterDataProvider = Pick<
 	FooterDataProvider,
-	"getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
+	"getGitBranch" | "getPullRequestUrl" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
 >;

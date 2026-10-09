@@ -1,5 +1,5 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, hyperlink, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ContextUsage } from "../../../core/extensions/types.ts";
@@ -162,18 +162,27 @@ export class FooterComponent implements Component {
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
-		let pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
+		const pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
+		let pwdLineRaw = theme.fg("dim", pwd);
 
-		// Add git branch if available
+		// Add git branch if available, highlighted so it's easy to spot at a glance
 		const branch = this.footerData.getGitBranch();
 		if (branch) {
-			pwd = `${pwd} (${branch})`;
+			pwdLineRaw += `${theme.fg("dim", " (")}${theme.fg("accent", branch)}${theme.fg("dim", ")")}`;
+
+			// Add the current branch's open PR as a clickable link, if one exists
+			const prUrl = this.footerData.getPullRequestUrl();
+			if (prUrl) {
+				const prNumber = /\/pull\/(\d+)/.exec(prUrl)?.[1];
+				const prLabel = prNumber ? `PR #${prNumber}` : "PR";
+				pwdLineRaw += `${theme.fg("dim", " · ")}${theme.fg("mdLink", hyperlink(prLabel, prUrl))}`;
+			}
 		}
 
 		// Add session name if set
 		const sessionName = this.session.sessionManager.getSessionName();
 		if (sessionName) {
-			pwd = `${pwd} • ${sessionName}`;
+			pwdLineRaw += theme.fg("dim", ` • ${sessionName}`);
 		}
 
 		// Build stats line
@@ -192,7 +201,7 @@ export class FooterComponent implements Component {
 			: false;
 		if (usageTotals.cost || usingSubscription) {
 			const costStr = `$${usageTotals.cost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`;
-			statsParts.push(costStr);
+			statsParts.push(theme.fg("accent", costStr));
 		}
 
 		// Colorize context percentage based on usage
@@ -206,6 +215,8 @@ export class FooterComponent implements Component {
 			contextPercentStr = theme.fg("error", contextPercentDisplay);
 		} else if (contextPercentValue > 70) {
 			contextPercentStr = theme.fg("warning", contextPercentDisplay);
+		} else if (contextPercentValue > 0) {
+			contextPercentStr = theme.fg("success", contextPercentDisplay);
 		} else {
 			contextPercentStr = contextPercentDisplay;
 		}
@@ -283,7 +294,7 @@ export class FooterComponent implements Component {
 		const remainder = statsLine.slice(statsLeft.length); // padding + rightSide
 		const dimRemainder = theme.fg("dim", remainder);
 
-		const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
+		const pwdLine = truncateToWidth(pwdLineRaw, width, theme.fg("dim", "..."));
 		const lines = [pwdLine, dimStatsLeft + dimRemainder];
 
 		// Add extension statuses on a single line, sorted by key alphabetically

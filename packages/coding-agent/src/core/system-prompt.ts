@@ -119,6 +119,9 @@ function buildRules(
 		for (const rule of toolGuidelines[name] ?? []) addRule(rule);
 	}
 	for (const rule of promptGuidelines) addRule(rule);
+	addRule(
+		"Mark these moments with a GFM admonition blockquote so they stand out from routine narration: `> [!DECISION]` for a design choice or trade-off you made and why, `> [!BLOCKED]` when you cannot proceed without something, `> [!ACTION]` when you need the user to approve, confirm, or choose something. Use them sparingly, only when something genuinely needs to stand out",
+	);
 	if (hasBash) {
 		addRule(
 			'When opening a pull request with `gh pr create`, include a "## Changes" section in the body: one bullet per changed file, formatted `path`: reason, stating only why that file changed (terse, skip files where the reason is obvious from the title)',

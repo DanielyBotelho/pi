@@ -1019,8 +1019,34 @@ export function getLanguageFromPath(filePath: string): string | undefined {
 	return extToLang[ext];
 }
 
+/**
+ * GFM admonition types this fork gives distinct colors to, keyed by `[!TYPE]` (case-insensitive).
+ * DECISION/BLOCKED/ACTION are this fork's own convention (see system prompt rules); the rest are the
+ * standard GFM set, included so the model's natural use of them is also styled instead of falling
+ * back to a plain quote.
+ */
+const ADMONITION_ROLES: Record<string, { label: string; role: ThemeColor }> = {
+	DECISION: { label: "Decision", role: "accent" },
+	BLOCKED: { label: "Blocked", role: "error" },
+	ACTION: { label: "Action needed", role: "warning" },
+	NOTE: { label: "Note", role: "mdLink" },
+	TIP: { label: "Tip", role: "success" },
+	IMPORTANT: { label: "Important", role: "accent" },
+	WARNING: { label: "Warning", role: "warning" },
+	CAUTION: { label: "Caution", role: "error" },
+};
+
 export function getMarkdownTheme(): MarkdownTheme {
 	return {
+		admonition: (type: string) => {
+			const entry = ADMONITION_ROLES[type.toUpperCase()];
+			if (!entry) return undefined;
+			return {
+				label: entry.label,
+				border: (text: string) => theme.fg(entry.role, text),
+				text: (text: string) => text,
+			};
+		},
 		heading: (text: string) => theme.fg("mdHeading", text),
 		link: (text: string) => theme.fg("mdLink", text),
 		linkUrl: (text: string) => theme.fg("mdLinkUrl", text),

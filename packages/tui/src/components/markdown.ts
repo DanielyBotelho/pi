@@ -193,6 +193,16 @@ export interface DefaultTextStyle {
 	underline?: boolean;
 }
 
+/** Styling for one recognized GFM-style admonition (`> [!TYPE]`) blockquote type. */
+export interface AdmonitionStyle {
+	/** Label shown on its own line at the top of the callout, e.g. "Decision", "Blocked". */
+	label: string;
+	/** Styles the left border ("│ ") and the label line. Carries the callout's color. */
+	border: (text: string) => string;
+	/** Styles each line of the callout's body text. */
+	text: (text: string) => string;
+}
+
 /**
  * Theme functions for markdown elements.
  * Each function takes text and returns styled text with ANSI codes.
@@ -215,6 +225,12 @@ export interface MarkdownTheme {
 	highlightCode?: (code: string, lang?: string) => string[];
 	/** Prefix applied to each rendered code block line (default: "  ") */
 	codeBlockIndent?: string;
+	/**
+	 * Looks up styling for a GFM-style admonition (`> [!TYPE]`) blockquote, e.g. `type: "NOTE"` or a
+	 * custom one like `"DECISION"`. Return undefined for an unrecognized type to fall back to the
+	 * default quote style.
+	 */
+	admonition?: (type: string) => AdmonitionStyle | undefined;
 }
 
 export interface MarkdownOptions {
@@ -564,10 +580,18 @@ export class Markdown implements Component {
 			}
 
 			case "blockquote": {
-				const quoteStyle = (text: string) => this.theme.quote(this.theme.italic(text));
-				const quoteStylePrefix = this.getStylePrefix(quoteStyle);
+				const blockquoteToken = token;
+				// GFM-style admonition: `> [!TYPE]` alone on the blockquote's first line.
+				const admonitionMatch = /^>[ \t]*\[!(\w+)\][ \t]*\n/.exec(blockquoteToken.raw);
+				const admonitionStyle =
+					admonitionMatch && this.theme.admonition ? this.theme.admonition(admonitionMatch[1]) : undefined;
+
+				const quoteStyle = admonitionStyle
+					? (text: string) => admonitionStyle.text(text)
+					: (text: string) => this.theme.quote(this.theme.italic(text));
+				const quoteStylePrefix = admonitionStyle ? "" : this.getStylePrefix(quoteStyle);
 				const applyQuoteStyle = (line: string): string => {
-					if (!quoteStylePrefix) {
+					if (admonitionStyle || !quoteStylePrefix) {
 						return quoteStyle(line);
 					}
 					const lineWithReappliedStyle = line.replace(/\x1b\[0m/g, `\x1b[0m${quoteStylePrefix}`);
@@ -584,7 +608,16 @@ export class Markdown implements Component {
 					applyText: (text: string) => text,
 					stylePrefix: quoteStylePrefix,
 				};
-				const quoteTokens = token.tokens || [];
+				// For a recognized admonition, re-lex the blockquote's raw source with the `[!TYPE]`
+				// marker line removed, so it renders as normal content instead of literal text.
+				let quoteTokens = blockquoteToken.tokens || [];
+				if (admonitionStyle && admonitionMatch) {
+					const strippedRaw = blockquoteToken.raw.slice(admonitionMatch[0].length);
+					const reparsed = strippedRaw.trim() ? markdownParser.lexer(strippedRaw) : [];
+					const reparsedBlockquote = reparsed[0];
+					quoteTokens =
+						reparsedBlockquote && reparsedBlockquote.type === "blockquote" ? reparsedBlockquote.tokens || [] : [];
+				}
 				const renderedQuoteLines: string[] = [];
 				for (let i = 0; i < quoteTokens.length; i++) {
 					const quoteToken = quoteTokens[i];
@@ -599,11 +632,15 @@ export class Markdown implements Component {
 					renderedQuoteLines.pop();
 				}
 
+				const border = admonitionStyle ? admonitionStyle.border : this.theme.quoteBorder;
+				if (admonitionStyle) {
+					lines.push(border(`│ ${admonitionStyle.label}`));
+				}
 				for (const quoteLine of renderedQuoteLines) {
 					const styledLine = applyQuoteStyle(quoteLine);
 					const wrappedLines = wrapTextWithAnsi(styledLine, quoteContentWidth);
 					for (const wrappedLine of wrappedLines) {
-						lines.push(this.theme.quoteBorder("│ ") + wrappedLine);
+						lines.push(border("│ ") + wrappedLine);
 					}
 				}
 				if (nextTokenType && nextTokenType !== "space") {

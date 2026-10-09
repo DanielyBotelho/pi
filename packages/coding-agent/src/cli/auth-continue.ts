@@ -103,7 +103,6 @@ function decodeBase64Json(inputValue: string): unknown {
 function parseAuthContinuationObject(raw: unknown): AuthContinuationPayload {
 	const object = asObject(raw, "Continuation payload");
 	if (object.version !== 1) throw new AuthContinueError("version must be 1");
-	const mcpRaw = asObject(object.mcp, "mcp");
 	const base: AuthContinuationBase = {
 		version: 1,
 		serviceUrl: requiredString(object.serviceUrl, "serviceUrl"),
@@ -112,6 +111,7 @@ function parseAuthContinuationObject(raw: unknown): AuthContinuationPayload {
 		secret: requiredString(object.secret, "secret"),
 		returnUrl: requiredString(object.returnUrl, "returnUrl"),
 	};
+	const mcpRaw = asObject(object.mcp, "mcp");
 	const mcpBase: McpContinuationBase = {
 		serverUrl: requiredString(mcpRaw.serverUrl, "mcp.serverUrl"),
 		serverName: requiredString(mcpRaw.serverName, "mcp.serverName"),
@@ -428,9 +428,7 @@ async function runMcpContinuation(
 	console.log(chalk.green("MCP connection saved."));
 }
 
-export async function runAuthContinueCommand(args: string[]): Promise<void> {
-	const inputPayload = args.length > 0 ? args.join(" ") : await readPayloadFromUser();
-	const payload = decodeAuthContinuationPayload(inputPayload);
+export async function runAuthContinuation(payload: AuthContinuationPayload): Promise<void> {
 	const serviceUrl = normalizeServiceUrl(payload.serviceUrl);
 	const signal = AbortSignal.timeout(15 * 60_000);
 	const token = await getContinuationServiceToken(payload.providerId, signal);
@@ -441,4 +439,9 @@ export async function runAuthContinueCommand(args: string[]): Promise<void> {
 		signal,
 	);
 	await runMcpContinuation(payload, token, serviceUrl, signal);
+}
+
+export async function runAuthContinueCommand(args: string[]): Promise<void> {
+	const inputPayload = args.length > 0 ? args.join(" ") : await readPayloadFromUser();
+	await runAuthContinuation(decodeAuthContinuationPayload(inputPayload));
 }

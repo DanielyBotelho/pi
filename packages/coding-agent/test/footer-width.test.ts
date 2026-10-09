@@ -96,6 +96,7 @@ function createFooterData(providerCount: number): ReadonlyFooterDataProvider {
 	const provider = {
 		getGitBranch: () => "main",
 		getPullRequestUrl: () => null,
+		getJiraUrl: () => null,
 		getExtensionStatuses: () => new Map<string, string>(),
 		getAvailableProviderCount: () => providerCount,
 		onBranchChange: (callback: () => void) => {

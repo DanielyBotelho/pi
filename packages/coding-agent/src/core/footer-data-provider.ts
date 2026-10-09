@@ -80,23 +80,53 @@ function resolveBranchWithGitAsync(repoDir: string): Promise<string | null> {
 	});
 }
 
-/** Ask `gh` for the current branch's open pull request URL. Null if there isn't one, or `gh` is unavailable. */
-function resolvePullRequestUrl(repoDir: string): Promise<string | null> {
+export type PullRequestInfo = {
+	url: string;
+	title: string;
+	body: string;
+};
+
+/**
+ * Ask `gh` for the current branch's open pull request (URL, title, body). Null if there isn't one, or
+ * `gh` is unavailable. Fetches title/body alongside the URL so the Jira-key fallback below doesn't need
+ * a second `gh` call.
+ */
+function resolvePullRequestInfo(repoDir: string): Promise<PullRequestInfo | null> {
 	return new Promise((resolvePromise) => {
 		execFile(
 			"gh",
-			["pr", "view", "--json", "url", "-q", ".url"],
+			["pr", "view", "--json", "url,title,body"],
 			{ cwd: repoDir, encoding: "utf8", timeout: 5000 },
 			(error: ExecFileException | null, stdout: string) => {
 				if (error) {
 					resolvePromise(null);
 					return;
 				}
-				const url = stdout.trim();
-				resolvePromise(url || null);
+				try {
+					const parsed = JSON.parse(stdout) as { url?: string; title?: string; body?: string };
+					resolvePromise(
+						parsed.url ? { url: parsed.url, title: parsed.title ?? "", body: parsed.body ?? "" } : null,
+					);
+				} catch {
+					resolvePromise(null);
+				}
 			},
 		);
 	});
+}
+
+/**
+ * Base URL used to build Jira issue links shown in the footer (e.g. `${JIRA_BASE_URL}/browse/SYN-123`).
+ * Update this if the Jira instance changes.
+ */
+const JIRA_BASE_URL = "https://syngenta.atlassian.net";
+
+/** Jira keys are an uppercase letter prefix (no digits) followed by a dash and a number, e.g. SYN-123. */
+const JIRA_KEY_PATTERN = /\b([A-Z]{2,10}-\d+)\b/;
+
+/** Find a Jira issue key in free text (branch name, PR title/body). Case-insensitive, returns it uppercased. */
+function extractJiraKey(text: string): string | null {
+	return JIRA_KEY_PATTERN.exec(text.toUpperCase())?.[1] ?? null;
 }
 
 function isWslEnvironment(): boolean {
@@ -121,7 +151,7 @@ export class FooterDataProvider {
 
 	private extensionStatuses = new Map<string, string>();
 	private cachedBranch: string | null | undefined = undefined;
-	private cachedPrUrl: string | null | undefined = undefined;
+	private cachedPrInfo: PullRequestInfo | null | undefined = undefined;
 	private prFetchInFlight = false;
 	private gitPaths: GitPaths | null | undefined = undefined;
 	private headWatcher: FSWatcher | null = null;
@@ -153,22 +183,42 @@ export class FooterDataProvider {
 	}
 
 	/**
-	 * URL of the open pull request for the current branch, null if there isn't one (or `gh` isn't
-	 * available). Undefined until the first call, which kicks off a background fetch via `gh pr view`
-	 * and notifies branch-change subscribers once it resolves.
+	 * Kicks off (once) a background fetch of the current branch's pull request via `gh pr view`, and
+	 * notifies branch-change subscribers once it resolves. `getPullRequestUrl` and `getJiraUrl` share
+	 * this fetch since the Jira-key fallback reads the PR title/body fetched alongside its URL.
 	 */
+	private ensurePrInfoFetch(): void {
+		if (this.cachedPrInfo !== undefined || this.prFetchInFlight || !this.gitPaths) return;
+		this.prFetchInFlight = true;
+		void resolvePullRequestInfo(this.gitPaths.repoDir).then((info) => {
+			this.prFetchInFlight = false;
+			if (this.disposed) return;
+			const changed = this.cachedPrInfo !== undefined && this.cachedPrInfo?.url !== info?.url;
+			this.cachedPrInfo = info;
+			if (changed) this.notifyBranchChange();
+		});
+	}
+
+	/** URL of the open pull request for the current branch, null if there isn't one (or `gh` isn't available). */
 	getPullRequestUrl(): string | null {
-		if (this.cachedPrUrl === undefined && !this.prFetchInFlight && this.gitPaths) {
-			this.prFetchInFlight = true;
-			void resolvePullRequestUrl(this.gitPaths.repoDir).then((url) => {
-				this.prFetchInFlight = false;
-				if (this.disposed) return;
-				const changed = this.cachedPrUrl !== undefined && this.cachedPrUrl !== url;
-				this.cachedPrUrl = url;
-				if (changed) this.notifyBranchChange();
-			});
-		}
-		return this.cachedPrUrl ?? null;
+		this.ensurePrInfoFetch();
+		return this.cachedPrInfo?.url ?? null;
+	}
+
+	/**
+	 * Jira issue link related to the current work: a key in the branch name wins (e.g.
+	 * `feature/SYN-123-thing`), falling back to one mentioned in the PR title or body. Null if neither
+	 * has one, there's no PR, or `gh` is unavailable.
+	 */
+	getJiraUrl(): string | null {
+		const branch = this.getGitBranch();
+		const branchKey = branch ? extractJiraKey(branch) : null;
+		if (branchKey) return `${JIRA_BASE_URL}/browse/${branchKey}`;
+
+		this.ensurePrInfoFetch();
+		if (!this.cachedPrInfo) return null;
+		const prKey = extractJiraKey(`${this.cachedPrInfo.title}\n${this.cachedPrInfo.body}`);
+		return prKey ? `${JIRA_BASE_URL}/browse/${prKey}` : null;
 	}
 
 	/** Extension status texts set via ctx.ui.setStatus() */
@@ -218,7 +268,7 @@ export class FooterDataProvider {
 		}
 		this.clearGitWatchers();
 		this.cachedBranch = undefined;
-		this.cachedPrUrl = undefined;
+		this.cachedPrInfo = undefined;
 		this.gitPaths = findGitPaths(cwd);
 		this.setupGitWatcher();
 		this.notifyBranchChange();
@@ -264,7 +314,7 @@ export class FooterDataProvider {
 			if (this.disposed) return;
 			if (this.cachedBranch !== undefined && this.cachedBranch !== nextBranch) {
 				this.cachedBranch = nextBranch;
-				this.cachedPrUrl = undefined;
+				this.cachedPrInfo = undefined;
 				this.notifyBranchChange();
 				return;
 			}
@@ -426,5 +476,10 @@ export class FooterDataProvider {
 /** Read-only view for extensions - excludes setExtensionStatus, setAvailableProviderCount and dispose */
 export type ReadonlyFooterDataProvider = Pick<
 	FooterDataProvider,
-	"getGitBranch" | "getPullRequestUrl" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
+	| "getGitBranch"
+	| "getPullRequestUrl"
+	| "getJiraUrl"
+	| "getExtensionStatuses"
+	| "getAvailableProviderCount"
+	| "onBranchChange"
 >;

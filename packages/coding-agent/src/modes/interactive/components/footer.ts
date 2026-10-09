@@ -177,6 +177,13 @@ export class FooterComponent implements Component {
 				const prLabel = prNumber ? `PR #${prNumber}` : "PR";
 				pwdLineRaw += `${theme.fg("dim", " · ")}${theme.fg("mdLink", hyperlink(prLabel, prUrl))}`;
 			}
+
+			// Add the related Jira issue as a clickable link, if the branch or PR names one
+			const jiraUrl = this.footerData.getJiraUrl();
+			if (jiraUrl) {
+				const jiraKey = /\/browse\/([^/]+)$/.exec(jiraUrl)?.[1] ?? "Jira";
+				pwdLineRaw += `${theme.fg("dim", " · ")}${theme.fg("syntaxType", hyperlink(jiraKey, jiraUrl))}`;
+			}
 		}
 
 		// Add session name if set

@@ -139,7 +139,6 @@ import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
-import { CAT_ART_COLUMNS, CAT_ART_ROWS, renderCatArt } from "./components/cat-logo.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -161,6 +160,7 @@ import {
 	formatAuthSelectorProviderType,
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.ts";
+import { PENGUIN_ART_COLUMNS, PENGUIN_ART_ROWS, renderPenguinArt } from "./components/penguin-logo.ts";
 import { piWordmark, supportsPiLogo } from "./components/pi-logo.ts";
 import { createLoginMenuSelector } from "./components/radius-login-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
@@ -1018,13 +1018,13 @@ export class InteractiveMode {
 		// Add header with keybindings from config (unless silenced)
 		if (this.shouldShowStartupHeader()) {
 			const showDetails = this.shouldShowStartupDetails();
-			// Built on demand so the header follows theme changes. The cat art sits above the version and key
+			// Built on demand so the header follows theme changes. The penguin art sits above the version and key
 			// hints. Terminals that cannot render the logo get a "Pi vX" line instead, with the hints below it.
 			const showLogo = supportsPiLogo();
 			let shimmerTick = 0;
 			const withLogo = (hints: string) => {
 				if (!showLogo) return `${piWordmark()} ${theme.fg("dim", `v${this.version}`)}\n${hints}`;
-				const art = renderCatArt(shimmerTick).join("\n");
+				const art = renderPenguinArt(shimmerTick).join("\n");
 				return `${art}\n${theme.fg("dim", `v${this.version}`)}\n${hints}`;
 			};
 
@@ -1080,9 +1080,9 @@ export class InteractiveMode {
 			);
 			if (showLogo) {
 				header.onLogoClick = (column, row) => playPiLogo3d(this.renderer, column, row);
-				header.logoRows = CAT_ART_ROWS;
-				header.logoColumns = CAT_ART_COLUMNS;
-				// Flowing color shimmer down the cat. unref() so the timer never keeps the process alive.
+				header.logoRows = PENGUIN_ART_ROWS;
+				header.logoColumns = PENGUIN_ART_COLUMNS;
+				// Flowing color shimmer and sparkles over the penguin. unref() so the timer never keeps the process alive.
 				setInterval(() => {
 					shimmerTick++;
 					header.invalidate();
